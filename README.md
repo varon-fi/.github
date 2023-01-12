@@ -1,2 +1,2 @@
-# .github
-Public README for varon.fi
+# varon.fi
+Advanced AI Crypto Trading
