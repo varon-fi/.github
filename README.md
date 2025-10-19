@@ -1,106 +1,266 @@
-# varon.fi
-Advanced AI Crypto Trading
+# varon.fi - AI Trading Platform Design Document
 
-## 1. Executive Summary
-This refined plan optimizes the design for a Python 3-based algorithmic trading platform focused on short-term, high-leverage scalping in cryptocurrency perpetual futures (perps). The primary DEX is Hyperliquid, selected for its on-chain order book, zero gas fees, support for up to 50x leverage on major pairs (e.g., BTC/USDT, ETH/USDT), and recent HIP-3 upgrade enabling user-deployed perps. Extensibility to other DEXes like dYdX or GMX is maintained via abstracted interfaces.
+## Executive Summary
 
-Optimizations include:
-- Unified IPC: Exclusively gRPC for all interprocess communication, leveraging its efficiency, bidirectional streaming, and strong typing to reduce complexity from multiple protocols. gRPC supports low-latency streaming for realtime data and unary calls for signals, aligning with trading system needs for performance and reliability.
-- Ambiguity Elimination: Precise library choices (e.g., Hyperliquid Python SDK v0.15.0+), data sources, schema definitions, and workflows based on industry standards from frameworks like Freqtrade and best practices in low-latency systems.
-- Focus: High-frequency scalping strategies (e.g., EMA crossovers, order book imbalances, funding rate arbitrage) with built-in risk controls to mitigate liquidation risks in high-leverage environments.
+varon.fi is a high-performance algorithmic trading platform designed for high-frequency cryptocurrency trading with machine learning strategies. The platform focuses on reliable data sources (Coinbase, major exchanges) and executes trades on Hyperliquid DEX for perpetual futures with up to 50x leverage.
 
-The architecture draws from microservices patterns, ensuring modularity, scalability, and testability while prioritizing security and performance.
+**Core Philosophy**: Modular, ML-first architecture that abstracts data collection, model training, signal generation, and order execution to enable rapid iteration on diverse trading strategies.
 
-## 2. Project Scope and Assumptions
-- **In-Scope**: Realtime data aggregation from specified sources; composable strategy framework with backtesting and live execution; order management on Hyperliquid and extensible DEXes; risk management (e.g., position limits, stop-loss enforcement).
-- **Out-of-Scope**: Graphical UI; regulatory compliance beyond basic logging; infrastructure orchestration (e.g., Kubernetes); advanced ML integration.
-- **Assumptions**: Hyperliquid API access via Python SDK; secure management of API private keys (e.g., via environment variables or vaults); platform deployment on a single machine or cloud VM with low-latency network; users accept high-leverage risks (e.g., potential liquidation at 50x).
-- **Constraints**: Adhere to API rate limits (e.g., Hyperliquid's 100 requests/second); no runtime package installations; target sub-100ms end-to-end latency for scalping.
+## Platform Architecture
 
-## 3. Architecture Principles
-- **Modularity**: Three core modules (data, strategy, execution) as independent Python processes, each with defined gRPC interfaces for loose coupling.
-- **Performance and Scalability**: Asynchronous Python via asyncio; gRPC for efficient protobuf-based communication; horizontal scaling by running multiple instances (e.g., per strategy).
-- **IPC Details**: gRPC exclusively:
-  - Server-side streaming for realtime data feeds (e.g., data module streams aggregated ticks to strategies).
-  - Unary RPC for discrete events (e.g., strategy sends trade signals to execution).
-  - Bidirectional streaming for interactive needs (e.g., execution status updates).
-  - No gRPC-web needed, as this is backend-only; use standard gRPC with Python's grpcio library.
-- **Configuration**: Single TOML file per module, loaded at startup with validation; no hot-reload to avoid runtime errors—restart processes for changes.
-- **Database**: PostgreSQL with TimescaleDB extension for time-series optimization, enabling fast queries on large datasets (e.g., continuous aggregation for OHLCV bars).
-- **Security and Reliability**: API keys stored in environment variables; exponential backoff for API retries; circuit breakers to halt trading on excessive losses (>5% daily drawdown); structured logging with logging library.
-- **Best Practices**: Separation of concerns; mandatory backtesting before live deployment; risk diversification (e.g., limit to 5 concurrent positions); use TA-Lib for indicators to ensure accuracy.
+### Design Principles
 
-## 4. Core Modules
-### 4.1 Data Acquisition and Aggregation
-- **Purpose**: Collect, process, and distribute realtime market data for scalping, ensuring <50ms processing latency.
-- **Key Features**:
-  - Sources: Hyperliquid API/SDK (primary for perps mids, order books, funding rates); CoinAPI or Amberdata (secondary for cross-market prices and historical backfills); no more than 3 sources to limit complexity.
-  - Aggregation: Use pandas for OHLCV bars (1s-1m intervals) and TA-Lib for initial indicators (e.g., EMA); validate data for gaps or anomalies.
-  - Storage: Insert into PostgreSQL/TimescaleDB hypertables; retain 7 days of tick data, archive older.
-  - Distribution: gRPC server-side streaming endpoint for subscribers (e.g., strategies request streams by symbol).
-- **Workflow**:
-  1. Async fetch via aiohttp and Hyperliquid SDK.
-  2. Aggregate in-memory, then batch-insert to DB every 10s.
-  3. Stream updates to connected clients.
-- **Best Practices**: Timestamp synchronization using UTC; handle disconnections with 5s reconnect intervals; data validation to discard outliers (>5% deviation).
+1. **Modularity**: Four core modules with clear interfaces
+2. **ML-First**: Built for machine learning strategy development and deployment
+3. **High-Frequency**: Sub-100ms latency for scalping strategies
+4. **Reliable Data**: Primary focus on Coinbase and major exchange data
+5. **Risk Management**: Built-in position limits and circuit breakers
 
-### 4.2 Strategy Development and Execution
-- **Purpose**: Build and run composable scalping strategies, generating precise signals with risk parameters.
-- **Key Features**:
-  - Composability: Implement Strategy Pattern—a base Strategy class with pluggable components:
-    - Indicators: TA-Lib wrappers (e.g., EMA(5,15), RSI(14)).
-    - Filters: Volume threshold (>1000 units), liquidity check (order book depth >10x position size).
-    - Risk Modules: Fixed position sizing (0.5% of portfolio), max leverage (50x), mandatory stop-loss (1% below entry).
-  - Configuration: TOML defines assembly (e.g., "ema_crossover + volume_filter + stop_loss").
-  - Testing: Backtest mode queries historical DB data; paper trading simulates execution without real orders.
-  - Execution: Process streamed data, generate signals (e.g., JSON: {"symbol": "BTC/USDT", "side": "buy", "leverage": 50, "size": 0.005, "stop_loss": 0.99*entry}).
-- **Workflow**:
-  1. Connect to data module via gRPC stream.
-  2. Apply components sequentially to input data.
-  3. If signal valid, send via unary gRPC to execution module.
-- **Best Practices**: Limit to 3-5 components per strategy to prevent overfitting; out-of-sample testing on 20% holdout data; log all signals for audits.
+### Core Modules
 
-### 4.3 Order Execution and Management
-- **Purpose**: Execute signals on DEXes, managing positions with minimal slippage.
-- **Key Features**:
-  - Order Handling: Use Hyperliquid SDK for market/limit/stop orders; track via API polling (every 1s).
-  - Account Management: Monitor balance, positions, funding (every 60s); support one wallet per DEX.
-  - Liquidity: Pre-check order book depth via API; reject if insufficient (>2x size at <0.5% slippage).
-  - Extensibility: Abstract base class (e.g., DexExecutor) with Hyperliquid implementation; add adapters for dYdX/GMX.
-- **Workflow**:
-  1. gRPC server listens for unary signal calls.
-  2. Validate against risk limits (e.g., total exposure <20% portfolio).
-  3. Place order, monitor until filled/canceled.
-  4. Log to DB; send status via bidirectional gRPC stream if requested.
-- **Best Practices**: Use limit orders for scalping to control entry; enforce kill switch on >10% loss; audit trails for all actions.
+#### 1. Data Collection Module
+**Purpose**: Aggregate reliable market data from major exchanges
 
-## 5. Database and Configuration Structure
-- **PostgreSQL/TimescaleDB Schemas** (Precise Definitions):
-  - market_data (hypertable): timestamp TIMESTAMPTZ (partition key), symbol VARCHAR(20), open NUMERIC(18,8), high NUMERIC(18,8), low NUMERIC(18,8), close NUMERIC(18,8), volume NUMERIC(18,8); index on (symbol, timestamp DESC).
-  - trades: id SERIAL PRIMARY KEY, strategy_id INT, symbol VARCHAR(20), side ENUM('buy','sell'), leverage INT, size NUMERIC(18,8), entry_price NUMERIC(18,8), exit_price NUMERIC(18,8), pnl NUMERIC(18,8), timestamp TIMESTAMPTZ.
-  - logs: id SERIAL PRIMARY KEY, level ENUM('info','warn','error'), message TEXT, timestamp TIMESTAMPTZ.
-- **TOML Configuration Example Structure** (One File Per Module):
-  - data.toml: db_url="postgresql://user:pass@host:5432/db", sources=["hyperliquid","coinapi"], api_keys={"hyperliquid":"env:HL_KEY"}, grpc_port=50051.
-  - strategy.toml: components=["ema:5,15","volume:1000","stop:0.01"], max_leverage=50, portfolio_size=10000.
-  - execution.toml: dex="hyperliquid", wallet_private="env:WALLET_KEY", max_exposure=0.2.
+**Key Features**:
+- **Primary Sources**: Coinbase WebSocket feeds, major exchange APIs
+- **Data Types**: OHLCV, order book snapshots, funding rates, volume data
+- **Storage**: PostgreSQL with TimescaleDB for time-series optimization
+- **Distribution**: gRPC streaming for real-time data feeds
 
-## 6. Implementation Roadmap
-1. **Setup (Weeks 1-2)**: Project skeleton; install dependencies (grpcio, pandas, ta-lib, psycopg2, hyperliquid-python-sdk); define gRPC protos (e.g., DataStream, TradeSignal).
-2. **Data Module (Weeks 3-4)**: Implement fetching/aggregation; TimescaleDB setup; gRPC streaming server.
-3. **Strategy Module (Weeks 5-6)**: Strategy class with components; backtesting logic; gRPC client for data, server for signals.
-4. **Execution Module (Weeks 7-8)**: SDK integration; order logic; gRPC server for signals.
-5. **Integration/Testing (Weeks 9-10)**: End-to-end tests with simulated data; performance benchmarks.
-6. **Optimization/Deployment (Weeks 11-12)**: Latency tuning; security review; Docker packaging.
+**Current Implementation**:
+- `coinbase/` - Coinbase WebSocket data collector
+- `dydx/` - dYdX integration (secondary)
+- `postgres/` - Database schema and migrations
 
-## 7. Risks and Mitigations
-- **Latency**: Monitor with logging; mitigate via async and gRPC optimizations.
-- **API Failures**: Exponential backoff (1s base, max 30s); fallback to secondary sources.
-- **Liquidation**: Enforce stops and leverage caps; simulate in backtests.
-- **Security**: Key vaulting; input validation on gRPC calls.
-- **Overfitting**: Mandatory holdout testing; limit strategy complexity.
+#### 2. ML Strategy Module
+**Purpose**: Develop, train, and deploy machine learning trading strategies
 
-## 8. Future Enhancements
-- Add dYdX/GMX adapters.
-- Integrate basic ML (e.g., scikit-learn for signal weighting).
-- Monitoring via Prometheus.
-- HIP-3 support for custom perps if staking thresholds met.
+**Key Features**:
+- **Strategy Types**: DRQN, DQN, Rainbow DQN, and custom ML models
+- **Training Pipeline**: Backtesting, validation, and model persistence
+- **Signal Generation**: Real-time inference and signal broadcasting
+- **Composability**: Modular strategy components and risk modules
+
+**Current Implementation**:
+- `poc/` - DRQN proof-of-concept with 500%+ outperformance
+- `models/` - Enhanced ML models and training pipelines
+- `trading-bot/` - Legacy trading bot implementations
+
+#### 3. Signal Execution Module
+**Purpose**: Execute trading signals on DEXes with risk management
+
+**Key Features**:
+- **Primary DEX**: Hyperliquid (on-chain order book, zero gas fees)
+- **Order Types**: Market, limit, stop-loss orders
+- **Risk Controls**: Position limits, leverage caps, circuit breakers
+- **Account Management**: Balance monitoring, position tracking
+
+**Current Implementation**:
+- `python/` - gRPC protocol definitions
+- `platform/` - Execution engine (in development)
+
+#### 4. Infrastructure Module
+**Purpose**: Platform orchestration, monitoring, and data persistence
+
+**Key Features**:
+- **Communication**: gRPC for inter-module communication
+- **Database**: PostgreSQL with TimescaleDB for time-series data
+- **Monitoring**: Logging, metrics, and performance tracking
+- **Configuration**: TOML-based configuration management
+
+**Current Implementation**:
+- `postgres/` - Database migrations and schema
+- `python/` - Shared utilities and gRPC stubs
+- `web/` - Monitoring dashboard (basic)
+
+## Data Strategy
+
+### Primary Data Sources
+
+1. **Coinbase**: Real-time WebSocket feeds for major crypto pairs
+   - High-frequency tick data
+   - Order book snapshots
+   - Volume and liquidity metrics
+
+2. **Major Exchanges**: Binance, Kraken, Gemini for cross-validation
+   - Price discovery and arbitrage opportunities
+   - Market depth analysis
+   - Funding rate data
+
+### Data Processing Pipeline
+
+1. **Real-time Collection**: WebSocket streams with <50ms latency
+2. **Aggregation**: OHLCV bars (1s, 1m, 5m intervals)
+3. **Feature Engineering**: Technical indicators, market microstructure
+4. **Storage**: TimescaleDB hypertables with automatic partitioning
+5. **Distribution**: gRPC streaming to ML strategies
+
+## ML Strategy Framework
+
+### Current ML Models
+
+#### DRQN (Deep Recurrent Q-Network)
+- **Performance**: 500%+ outperformance over buy-and-hold
+- **Features**: Action augmentation, LSTM-based sequential learning
+- **Implementation**: Production-ready with CLI training/validation
+
+#### DQN Variants
+- **Double DQN**: Reduced overestimation bias
+- **Rainbow DQN**: Multiple improvements combined
+- **Noisy Networks**: Exploration without epsilon-greedy
+
+### Strategy Development Workflow
+
+1. **Data Preparation**: Historical data from reliable sources
+2. **Feature Engineering**: Technical indicators, market features
+3. **Model Training**: Backtesting with proper validation splits
+4. **Strategy Validation**: Out-of-sample testing and cross-validation
+5. **Live Deployment**: Real-time signal generation and execution
+
+### Modular Strategy Components
+
+- **Indicators**: EMA, RSI, MACD, custom ML features
+- **Filters**: Volume thresholds, liquidity checks, market conditions
+- **Risk Modules**: Position sizing, stop-loss, leverage management
+- **Execution**: Order routing, slippage control, timing optimization
+
+## MVP Implementation
+
+### Phase 1: Data Foundation
+- **Data Sources**: Coinbase WebSocket integration
+- **Database**: TimescaleDB setup with proper schema
+- **Storage**: Historical data collection and management
+
+### Phase 2: ML Strategy Development
+- **Model Training**: DRQN implementation with backtesting
+- **Validation**: Out-of-sample testing and performance metrics
+- **Signal Generation**: Real-time inference pipeline
+
+### Phase 3: Execution Integration
+- **DEX Integration**: Hyperliquid SDK integration
+- **Order Management**: Risk controls and position management
+- **Monitoring**: Real-time performance tracking
+
+### Phase 4: Platform Orchestration
+- **gRPC Communication**: Inter-module communication
+- **Configuration**: TOML-based module configuration
+- **Monitoring**: Logging, metrics, and alerting
+
+## Technical Specifications
+
+### Performance Requirements
+- **Latency**: <100ms end-to-end for signal generation
+- **Throughput**: High-frequency data streaming (1s intervals)
+- **Scalability**: Horizontal scaling via multiple strategy instances
+- **Reliability**: 99.9% uptime with automatic reconnection
+
+### Database Schema
+```sql
+-- Market data hypertable
+CREATE TABLE market_data (
+    timestamp TIMESTAMPTZ,
+    symbol VARCHAR(20),
+    open NUMERIC(18,8),
+    high NUMERIC(18,8),
+    low NUMERIC(18,8),
+    close NUMERIC(18,8),
+    volume NUMERIC(18,8)
+);
+
+-- Strategy execution tracking
+CREATE TABLE trades (
+    id SERIAL PRIMARY KEY,
+    strategy_id INT,
+    symbol VARCHAR(20),
+    side ENUM('buy','sell'),
+    leverage INT,
+    size NUMERIC(18,8),
+    entry_price NUMERIC(18,8),
+    exit_price NUMERIC(18,8),
+    pnl NUMERIC(18,8),
+    timestamp TIMESTAMPTZ
+);
+```
+
+### gRPC Communication
+- **Data Streaming**: Server-side streaming for real-time feeds
+- **Signal Execution**: Unary RPC for discrete trading signals
+- **Status Updates**: Bidirectional streaming for execution status
+
+## Risk Management
+
+### Position Limits
+- **Maximum Exposure**: 20% of portfolio per strategy
+- **Leverage Caps**: Configurable maximum leverage (up to 50x)
+- **Stop Loss**: Mandatory stop-loss enforcement
+- **Daily Loss Limits**: Circuit breakers for excessive losses
+
+### Safety Features
+- **Kill Switch**: Emergency halt functionality
+- **Input Validation**: All gRPC calls validated
+- **Audit Trails**: Complete logging of all trading actions
+- **API Key Management**: Secure credential storage
+
+## Development Roadmap
+
+### Immediate Priorities (Weeks 1-4)
+1. **Data Pipeline**: Complete Coinbase integration
+2. **ML Models**: Enhance DRQN implementation
+3. **Database**: TimescaleDB optimization
+4. **Testing**: Comprehensive backtesting framework
+
+### Short-term Goals (Weeks 5-8)
+1. **Hyperliquid Integration**: DEX execution module
+2. **Strategy Framework**: Modular component system
+3. **Risk Management**: Position and exposure controls
+4. **Monitoring**: Real-time performance tracking
+
+### Long-term Vision (Weeks 9-12)
+1. **Multi-DEX Support**: dYdX, GMX integration
+2. **Advanced ML**: Ensemble methods, reinforcement learning
+3. **Platform Orchestration**: Full gRPC communication
+4. **Production Deployment**: Scalable, reliable trading system
+
+## Project Structure
+
+```
+varon-fi/
+├── .github/              # Design documents and project management
+├── python/               # Shared Python package with gRPC protocol
+├── postgres/             # Database migrations and TimescaleDB setup
+├── coinbase/             # Coinbase WebSocket data collector
+├── dydx/                 # dYdX API integration
+├── poc/                  # DRQN proof-of-concept implementation
+├── models/               # Enhanced ML models and training pipelines
+├── trading-bot/          # Legacy trading bot implementations
+├── platform/             # Execution engine and orchestration
+└── web/                  # Monitoring dashboard
+```
+
+## Success Metrics
+
+### Technical Performance
+- **Latency**: <100ms end-to-end signal generation
+- **Accuracy**: >80% signal accuracy in backtesting
+- **Uptime**: 99.9% system availability
+- **Scalability**: Support for 10+ concurrent strategies
+
+### Trading Performance
+- **Returns**: Outperformance over buy-and-hold baselines
+- **Risk-Adjusted Returns**: Sharpe ratio >1.5
+- **Drawdown**: Maximum drawdown <10%
+- **Consistency**: Positive returns across market conditions
+
+## Risk Disclaimer
+
+This platform is designed for high-leverage trading which carries significant risk of loss. Users should:
+
+- Understand the risks of high-leverage trading
+- Start with small position sizes
+- Test strategies thoroughly in backtesting
+- Monitor positions continuously
+- Have appropriate risk management in place
+
+---
+
+*This design document serves as the authoritative guide for varon.fi platform development and should be updated as the platform evolves.*
